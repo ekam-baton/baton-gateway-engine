@@ -1,0 +1,25 @@
+[package]
+name = "baton-gateway-engine"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+aes-gcm = "0.10"
+base64 = "0.21"
+x25519-dalek = { version = "2.0.0-rc.3", features = ["static_secrets"] }
+sha2 = "0.10"
+hmac = "0.12"
+rand = "0.8"
+hkdf = "0.12"
+zeroize = "1.8"
+hex = "0.4"
+# Rate limiting — per-IP request throttle to prevent DoS / brute-force
+governor = { version = "0.6", features = ["std", "dashmap"] }
+# Non-zero duration support required by governor
+nonzero_ext = "0.3"
+# HTTP Client for internal tool server (e.g. OSV.dev CVE lookups)
+reqwest = { version = "0.12", features = ["json"] }
+dashmap = "5.5"
