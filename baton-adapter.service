@@ -1,0 +1,20 @@
+[Unit]
+Description=Baton Gateway Engine Adapter
+After=network.target
+
+[Service]
+Type=simple
+User=baton
+Group=baton
+ExecStart=/usr/local/bin/baton-adapter
+Restart=always
+RestartSec=5
+WorkingDirectory=/var/lib/baton
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/baton
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

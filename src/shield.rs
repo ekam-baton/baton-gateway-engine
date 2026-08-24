@@ -60,16 +60,19 @@ impl ShieldFirewall {
         }
     }
 
-    /// Extracts real client IP behind proxy. NEVER returns loopback (127.0.0.1) for blacklisting.
-    pub fn resolve_real_ip(socket_ip: IpAddr, header_str: &str) -> IpAddr {
-        if socket_ip.is_loopback() {
-            for line in header_str.lines() {
-                let lower = line.to_lowercase();
-                if lower.starts_with("x-real-ip:") || lower.starts_with("x-forwarded-for:") {
-                    if let Some(val) = line.splitn(2, ':').nth(1) {
-                        let client_ip_str = val.split(',').next().unwrap_or("").trim();
-                        if let Ok(ip) = client_ip_str.parse::<IpAddr>() {
-                            if !ip.is_loopback() {
+    pub fn resolve_real_ip(socket_ip: IpAddr, header_str: &str, trusted_proxies: &[IpAddr]) -> IpAddr {
+        if !trusted_proxies.contains(&socket_ip) {
+            return socket_ip; // Don't trust forwarded headers from untrusted sources
+        }
+        for line in header_str.lines() {
+            let lower = line.to_lowercase();
+            if lower.starts_with("x-real-ip:") || lower.starts_with("x-forwarded-for:") {
+                if let Some(val) = line.splitn(2, ':').nth(1) {
+                    let ips: Vec<&str> = val.split(',').collect();
+                    // Iterate from right (most trusted) to left to find the first untrusted IP
+                    for ip_str in ips.iter().rev() {
+                        if let Ok(ip) = ip_str.trim().parse::<IpAddr>() {
+                            if !trusted_proxies.contains(&ip) && !ip.is_loopback() {
                                 return ip;
                             }
                         }
@@ -129,18 +132,47 @@ impl ShieldFirewall {
         }
     }
 
-    /// Inspects HTTP Header strings and URI paths for high entropy obfuscation / shellcode
+    /// Inspects HTTP Header strings and URI paths for high entropy obfuscation / shellcode / SQLi
     pub fn inspect_headers_and_uri(&self, ip: IpAddr, header_str: &str) -> Result<(), String> {
         if self.is_blacklisted(&ip) {
             return Err(format!("IP {} is blacklisted by BATON-Shield Firewall", ip));
         }
 
-        // Check header strings for localized high-entropy shellcode (threshold > 7.2)
-        if check_chunked_entropy(header_str.as_bytes(), 7.2) {
-            self.record_violation(ip, "High entropy detected in HTTP headers (Obfuscated attack vector)");
+        let lower_headers = header_str.to_lowercase();
+        
+        // Strict pattern matching for zero-day payloads, SQLi, path traversal
+        let malicious_patterns = ["../", "..\\", "<script>", "union select", "waitfor delay", "eval(", "/etc/passwd", "cmd.exe"];
+        for pattern in malicious_patterns.iter() {
+            if lower_headers.contains(pattern) {
+                // Immediate ban (add max violations)
+                for _ in 0..self.max_violations {
+                    self.record_violation(ip, &format!("Malicious pattern detected: {}", pattern));
+                }
+                self.log_to_file(ip, "Malicious pattern match");
+                return Err(format!("BATON-Shield: Malicious pattern detected: {}", pattern));
+            }
+        }
+
+        // Check header strings for localized high-entropy shellcode (threshold > 7.0 for stricter blocking)
+        if check_chunked_entropy(header_str.as_bytes(), 7.0) {
+            // Immediate ban for high entropy
+            for _ in 0..self.max_violations {
+                self.record_violation(ip, "High entropy detected in HTTP headers (Obfuscated attack vector)");
+            }
+            self.log_to_file(ip, "High entropy shellcode");
             return Err("BATON-Shield: High entropy detected in HTTP headers".to_string());
         }
 
         Ok(())
+    }
+
+    /// Appends the block event to a persistent JSONL audit log
+    fn log_to_file(&self, ip: IpAddr, reason: &str) {
+        use std::io::Write;
+        let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        let log_entry = format!(r#"{{"timestamp": {}, "ip": "{}", "reason": "{}"}}"#, timestamp, ip, reason);
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("firewall_blocks.jsonl") {
+            let _ = writeln!(file, "{}", log_entry);
+        }
     }
 }

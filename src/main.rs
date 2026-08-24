@@ -20,6 +20,8 @@ use zeroize::Zeroize;
 
 type HmacSha256 = Hmac<Sha256>;
 
+use subtle::ConstantTimeEq;
+
 mod sbom;
 mod shield;
 use shield::ShieldFirewall;
@@ -60,6 +62,34 @@ struct PersistedKeypair {
 /// permissions (chmod 600).  Never commit it to version control — it is
 /// listed in .gitignore.
 fn load_or_create_keypair() -> StaticSecret {
+    if let Ok(env_key) = std::env::var("GATEWAY_PRIVATE_KEY") {
+        if let Ok(bytes) = hex::decode(env_key.trim()) {
+            if bytes.len() == 32 {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&bytes);
+                eprintln!("[GATEWAY] Loaded keypair from GATEWAY_PRIVATE_KEY env var");
+                return StaticSecret::from(arr);
+            }
+        }
+    }
+
+    let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_else(|_| ".".to_string());
+    let env_path = format!("{}/.baton/.env", home);
+    if let Ok(data) = fs::read_to_string(&env_path) {
+        for line in data.lines() {
+            if let Some(key_hex) = line.strip_prefix("PRIVATE_KEY=") {
+                if let Ok(bytes) = hex::decode(key_hex.trim()) {
+                    if bytes.len() == 32 {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&bytes);
+                        eprintln!("[GATEWAY] Loaded keypair from {}", env_path);
+                        return StaticSecret::from(arr);
+                    }
+                }
+            }
+        }
+    }
+
     if let Ok(data) = fs::read_to_string(KEYPAIR_FILE) {
         if let Ok(persisted) = serde_json::from_str::<PersistedKeypair>(&data) {
             if let Ok(bytes) = hex::decode(&persisted.private_key_hex) {
@@ -123,14 +153,19 @@ fn load_trusted_clients() -> Result<Vec<TrustedClient>, String> {
         .map_err(|e| format!("Malformed trusted_clients file: {}", e))
 }
 
+#[derive(Clone)]
+struct GatewayState {
+    trusted_clients: Arc<std::sync::RwLock<Vec<TrustedClient>>>,
+    olm_account: Arc<tokio::sync::Mutex<vodozemac::olm::Account>>,
+}
+
 /// Look up a hex-encoded public key in the trusted-clients database.
-fn authorize_client_key(hex_key: &str) -> Result<TrustedClient, (u16, &'static str)> {
-    let clients = load_trusted_clients().map_err(|_| (500u16, "Internal server error"))?;
+fn authorize_client_key(clients: &[TrustedClient], hex_key: &str) -> Result<TrustedClient, (u16, &'static str)> {
     let normalised = hex_key.trim().to_lowercase();
-    match clients.into_iter().find(|c| c.client_public_key.trim().to_lowercase() == normalised) {
+    match clients.iter().find(|c| c.client_public_key.trim().to_lowercase() == normalised) {
         None => Err((403, "Unknown client key")),
         Some(c) if !c.is_active => Err((403, "Access revoked")),
-        Some(c) => Ok(c),
+        Some(c) => Ok(c.clone()),
     }
 }
 
@@ -153,10 +188,12 @@ impl NonceStore {
     /// the TTL window.  Returns false for replays.  Also prunes stale
     /// entries and enforces a hard size cap to prevent memory exhaustion.
     fn check_and_add(&mut self, nonce: &str, now_ms: u64) -> bool {
-        // Prune expired entries first
-        self.nonces.retain(|_, &mut inserted_at| {
-            now_ms.saturating_sub(inserted_at) < NONCE_TTL_MS
-        });
+        // Only prune every 1000 calls instead of every call
+        if self.nonces.len() > 10000 {
+            self.nonces.retain(|_, &mut inserted_at| {
+                now_ms.saturating_sub(inserted_at) < NONCE_TTL_MS
+            });
+        }
 
         // Hard cap — reject new nonces if the store is saturated
         if self.nonces.len() >= MAX_NONCE_STORE_SIZE {
@@ -187,13 +224,25 @@ pub struct LogEntry {
 pub struct TelemetryStore {
     logs: VecDeque<LogEntry>,
     capacity: usize,
+    webhook_secret: String,
 }
 
 impl TelemetryStore {
     fn new(capacity: usize) -> Self {
+        let webhook_secret = match std::env::var("SWARM_WEBHOOK_SECRET") {
+            Ok(s) => {
+                eprintln!("[GATEWAY] SWARM_WEBHOOK_SECRET found in environment.");
+                s
+            }
+            Err(_) => {
+                eprintln!("[GATEWAY] WARNING: SWARM_WEBHOOK_SECRET not set, using generated random fallback for dev mode.");
+                hex::encode(rand::random::<[u8; 16]>())
+            }
+        };
         Self {
             logs: VecDeque::with_capacity(capacity),
             capacity,
+            webhook_secret,
         }
     }
 
@@ -201,7 +250,7 @@ impl TelemetryStore {
         if self.logs.len() >= self.capacity {
             self.logs.pop_front();
         }
-        let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
         let entry = LogEntry {
             timestamp,
             level: level.to_string(),
@@ -214,16 +263,19 @@ impl TelemetryStore {
         if level == "WARN" || level == "CRITICAL" {
             if let Ok(json_line) = serde_json::to_string(&entry) {
                 use std::io::Write;
-                if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("telemetry_dataset.jsonl") {
-                    let _ = writeln!(file, "{}", json_line);
-                }
+                let json_line_clone = json_line.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("telemetry_dataset.jsonl") {
+                        let _ = writeln!(file, "{}", json_line_clone);
+                    }
+                });
             }
         }
 
         if level == "CRITICAL" {
             let msg_clone = msg.clone();
+            let secret = self.webhook_secret.clone();
             tokio::spawn(async move {
-                let secret = std::env::var("SWARM_WEBHOOK_SECRET").unwrap_or_else(|_| "baton-super-secret-key-2026".to_string());
                 let payload = serde_json::json!({
                     "title": "CRITICAL Gateway Alert",
                     "description": msg_clone,
@@ -253,6 +305,22 @@ impl TelemetryStore {
 
     fn get_logs(&self, limit: usize) -> Vec<LogEntry> {
         self.logs.iter().rev().take(limit).cloned().collect()
+    }
+
+    fn flush(&self) {
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("telemetry_dataset.jsonl") {
+            for entry in &self.logs {
+                // only write INFO logs to flush file since WARN/CRITICAL are already written
+                if entry.level == "INFO" {
+                    if let Ok(json_line) = serde_json::to_string(entry) {
+                        let _ = writeln!(file, "{}", json_line);
+                    }
+                }
+            }
+            let _ = file.flush();
+        }
+        eprintln!("[GATEWAY] Telemetry store flushed to telemetry_dataset.jsonl.");
     }
 }
 
@@ -285,6 +353,27 @@ async fn run_tool_server(telemetry: Arc<Mutex<TelemetryStore>>) -> Result<(), Bo
             }
 
             let header_str = String::from_utf8_lossy(&raw[..header_end]).into_owned();
+
+            let expected_key = std::env::var("MGMT_API_KEY").unwrap_or_default();
+            let mut auth_ok = false;
+            for line in header_str.lines().skip(1) {
+                let lower = line.to_lowercase();
+                if lower.starts_with("mgmt-api-key:") {
+                    if let Some(val) = line.splitn(2, ':').nth(1) {
+                        use sha2::{Sha256, Digest};
+                        let expected_hash = Sha256::digest(expected_key.as_bytes());
+                        let provided_hash = Sha256::digest(val.trim().as_bytes());
+                        if !expected_key.is_empty() && expected_hash.ct_eq(&provided_hash).into() {
+                            auth_ok = true;
+                        }
+                    }
+                }
+            }
+
+            if !auth_ok {
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, b"HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n").await;
+                return;
+            }
             let content_length: usize = header_str
                 .lines()
                 .find_map(|line| {
@@ -296,6 +385,12 @@ async fn run_tool_server(telemetry: Arc<Mutex<TelemetryStore>>) -> Result<(), Bo
                     }
                 })
                 .unwrap_or(0);
+
+            const MAX_MGMT_BODY: usize = 65536; // 64KB
+            if content_length > MAX_MGMT_BODY {
+                let _ = socket.write_all(b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n\r\n").await;
+                return;
+            }
 
             let body_end = header_end + 4 + content_length;
             while raw.len() < body_end {
@@ -429,11 +524,211 @@ async fn orchestrator_loop(telemetry: Arc<Mutex<TelemetryStore>>) {
 }
 
 // ---------------------------------------------------------------------------
+// Setup & Management API
+// ---------------------------------------------------------------------------
+
+async fn run_setup() -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
+    let mut mcp_url = String::new();
+    let mut cloud_router = String::new();
+    
+    print!("Enter MCP_AGENT_URL: ");
+    std::io::stdout().flush()?;
+    std::io::stdin().read_line(&mut mcp_url)?;
+    
+    print!("Enter CLOUD_ROUTER_URL: ");
+    std::io::stdout().flush()?;
+    std::io::stdin().read_line(&mut cloud_router)?;
+    
+    // Generate keypair
+    let secret = x25519_dalek::StaticSecret::random_from_rng(rand::thread_rng());
+    let public = x25519_dalek::PublicKey::from(&secret);
+    
+    // Generate MGMT_API_KEY
+    let mgmt_api_key = hex::encode(rand::random::<[u8; 16]>());
+    
+    let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_else(|_| ".".to_string());
+    let dir = format!("{}/.baton", home);
+    std::fs::create_dir_all(&dir)?;
+    let env_path = format!("{}/.env", dir);
+    
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).write(true).truncate(true);
+    
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    
+    let mut file = options.open(&env_path)?;
+    writeln!(file, "PRIVATE_KEY={}", hex::encode(secret.to_bytes()))?;
+    
+    println!("--- SETUP COMPLETE ---");
+    println!("MCP_AGENT_URL={}", mcp_url.trim());
+    println!("CLOUD_ROUTER_URL={}", cloud_router.trim());
+    println!("Private key saved securely to ~/.baton/.env");
+    println!("PUBLIC_KEY={}", hex::encode(public.as_bytes()));
+    println!("MGMT_API_KEY={}", mgmt_api_key);
+    
+    Ok(())
+}
+
+async fn run_mgmt_api(telemetry: Arc<Mutex<TelemetryStore>>, shutdown_flag: Arc<tokio::sync::Notify>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mgmt_bind = std::env::var("MGMT_BIND").unwrap_or_else(|_| "127.0.0.1:8082".to_string());
+    let listener = tokio::net::TcpListener::bind(&mgmt_bind).await?;
+    let expected_key = std::env::var("MGMT_API_KEY").unwrap_or_default();
+    eprintln!("[MGMT API] Listening on {}", mgmt_bind);
+    
+    loop {
+        let (mut socket, _) = listener.accept().await?;
+        let telemetry = Arc::clone(&telemetry);
+        let expected_key = expected_key.clone();
+        let shutdown_flag = Arc::clone(&shutdown_flag);
+        
+        tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            let mut raw = Vec::new();
+            let header_end: usize;
+            loop {
+                match tokio::io::AsyncReadExt::read(&mut socket, &mut buf).await {
+                    Ok(0) => return,
+                    Ok(n) => {
+                        raw.extend_from_slice(&buf[..n]);
+                        if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                            header_end = pos;
+                            break;
+                        }
+                    }
+                    Err(_) => return,
+                }
+            }
+
+            let header_str = String::from_utf8_lossy(&raw[..header_end]).into_owned();
+            let mut auth_ok = false;
+            let mut path = "";
+            
+            for (i, line) in header_str.lines().enumerate() {
+                if i == 0 {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() >= 2 {
+                        path = parts[1];
+                    }
+                } else {
+                    let lower = line.to_lowercase();
+                    if lower.starts_with("mgmt-api-key:") {
+                        if let Some(val) = line.splitn(2, ':').nth(1) {
+                            use sha2::{Sha256, Digest};
+                            let expected_hash = Sha256::digest(expected_key.as_bytes());
+                            let provided_hash = Sha256::digest(val.trim().as_bytes());
+                            if !expected_key.is_empty() && expected_hash.ct_eq(&provided_hash).into() {
+                                auth_ok = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !auth_ok {
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, b"HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n").await;
+                return;
+            }
+
+            let mut response_body = String::new();
+            if path == "/mgmt/status" {
+                response_body = r#"{"status":"ok"}"#.to_string();
+            } else if path == "/mgmt/logs" {
+                let logs = telemetry.lock().await.get_logs(100);
+                response_body = serde_json::to_string(&logs).unwrap_or_else(|_| "[]".to_string());
+            } else if path == "/mgmt/restart" {
+                response_body = r#"{"status":"restarting"}"#.to_string();
+                let http_response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, http_response.as_bytes()).await;
+                shutdown_flag.notify_one();
+                return;
+            } else {
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, b"HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n").await;
+                return;
+            }
+
+            let http_response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, http_response.as_bytes()).await;
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
+async fn run_login() -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
+
+    let email = std::env::var("BATON_EMAIL").unwrap_or_else(|_| {
+        print!("Enter Email: ");
+        std::io::stdout().flush().unwrap();
+        let mut email = String::new();
+        std::io::stdin().read_line(&mut email).unwrap_or_default();
+        email.trim().to_string()
+    });
+    
+    let password = std::env::var("BATON_PASSWORD").unwrap_or_else(|_| {
+        print!("Enter Password: ");
+        std::io::stdout().flush().unwrap();
+        let mut password = String::new();
+        // rpassword should be used in production
+        std::io::stdin().read_line(&mut password).unwrap_or_default();
+        password.trim().to_string()
+    });
+
+    let client = reqwest::Client::new();
+    let payload = serde_json::json!({
+        "email": email,
+        "password": password,
+    });
+    
+    let res = client.post("http://127.0.0.1:3001/auth/login")
+        .json(&payload)
+        .send()
+        .await?;
+        
+    if res.status().is_success() {
+        let json: serde_json::Value = res.json().await?;
+        if let Some(token) = json["token"].as_str() {
+            std::fs::write("gateway_jwt.txt", token)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions("gateway_jwt.txt", std::fs::Permissions::from_mode(0o600));
+            }
+            println!("Login successful. JWT securely saved to gateway_jwt.txt");
+        }
+    } else {
+        println!("Login failed: {:?}", res.text().await?);
+    }
+    
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 && args[1] == "login" {
+        return run_login().await;
+    }
+    if args.len() > 1 && args[1] == "setup" {
+        return run_setup().await;
+    }
+
     // 1. Load or generate the gateway X25519 keypair from disk.
     //    The public key is NOT printed to stdout — distribute it through
     //    a separate, controlled enrollment channel.
@@ -448,11 +743,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("Distribute this key through your secure enrollment channel.");
     eprintln!("==========================================");
 
-    // Validate that trusted_clients file is present and parseable at startup.
-    match load_trusted_clients() {
-        Ok(clients) => eprintln!("[GATEWAY] Loaded {} trusted client(s)", clients.len()),
-        Err(e) => eprintln!("[GATEWAY] WARNING: {}", e),
-    }
+    let initial_clients = load_trusted_clients().unwrap_or_else(|e| {
+        eprintln!("[GATEWAY] WARNING: {}", e);
+        Vec::new()
+    });
+    eprintln!("[GATEWAY] Loaded {} trusted client(s)", initial_clients.len());
+
+    let mut olm_account = vodozemac::olm::Account::new();
+    olm_account.generate_one_time_keys(10);
+    eprintln!("[GATEWAY] Olm Identity Key: {}", olm_account.curve25519_key().to_base64());
+
+    let gateway_state = GatewayState {
+        trusted_clients: Arc::new(std::sync::RwLock::new(initial_clients)),
+        olm_account: Arc::new(tokio::sync::Mutex::new(olm_account)),
+    };
+    
+    let state_for_bg = gateway_state.clone();
+    tokio::spawn(async move {
+        let path = std::env::var("TRUSTED_CLIENTS_PATH").unwrap_or_else(|_| "trusted_clients.json".to_string());
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+        let mut last_modified = std::time::SystemTime::UNIX_EPOCH;
+        loop {
+            interval.tick().await;
+            if let Ok(metadata) = std::fs::metadata(&path) {
+                if let Ok(modified) = metadata.modified() {
+                    if modified > last_modified {
+                        last_modified = modified;
+                        if let Ok(clients) = load_trusted_clients() {
+                            *state_for_bg.trusted_clients.write().unwrap_or_else(|p| p.into_inner()) = clients;
+                            eprintln!("[GATEWAY] Reloaded trusted clients from disk.");
+                        }
+                    }
+                }
+            }
+        }
+    });
 
     // Shared nonce store — tokio::sync::Mutex is non-blocking in async context
     let nonce_store: Arc<Mutex<NonceStore>> = Arc::new(Mutex::new(NonceStore::new()));
@@ -461,9 +786,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let telemetry_store: Arc<Mutex<TelemetryStore>> = Arc::new(Mutex::new(TelemetryStore::new(1000)));
     let telemetry_for_server = Arc::clone(&telemetry_store);
 
+    let mcp_url = std::env::var("MCP_AGENT_URL").unwrap_or_else(|_| "http://127.0.0.1:8000/mcp".to_string());
+    if !mcp_url.starts_with("http://127.0.0.1") && !mcp_url.starts_with("http://localhost") && !mcp_url.starts_with("https://") {
+        eprintln!("[GATEWAY] ⚠️  WARNING: MCP_AGENT_URL ({}) is a remote HTTP endpoint. Decrypted payloads will be sent in plaintext. Use HTTPS for remote agents.", mcp_url);
+    }
+
+    let trusted_proxies: Arc<Vec<IpAddr>> = Arc::new(std::env::var("TRUSTED_PROXY_IPS")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect());
+
     tokio::spawn(async move {
         if let Err(e) = run_tool_server(telemetry_for_server).await {
             eprintln!("[TOOL SERVER] Fatal error: {}", e);
+        }
+    });
+
+    let telemetry_for_mgmt = Arc::clone(&telemetry_store);
+    let shutdown_flag = Arc::new(tokio::sync::Notify::new());
+    let shutdown_flag_for_mgmt = Arc::clone(&shutdown_flag);
+    tokio::spawn(async move {
+        if let Err(e) = run_mgmt_api(telemetry_for_mgmt, shutdown_flag_for_mgmt).await {
+            eprintln!("[MGMT API] Fatal error: {}", e);
         }
     });
 
@@ -483,6 +828,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         RateLimiter::keyed(Quota::per_minute(nonzero!(30u32)))
     );
 
+    let mcp_client = reqwest::Client::new();
+
     // BATON-Shield Custom AI-Aware Firewall Engine
     let shield_firewall = Arc::new(ShieldFirewall::new(3, 3600));
 
@@ -493,22 +840,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     telemetry_store.lock().await.push("INFO", format!("Gateway listening on {}", bind_addr));
 
     loop {
-        let (mut socket, addr) = listener.accept().await?;
-        let nonce_store = Arc::clone(&nonce_store);
-        let private_key = Arc::clone(&private_key);
-        let rate_limiter = Arc::clone(&rate_limiter);
-        let shield_firewall = Arc::clone(&shield_firewall);
-        let telemetry = Arc::clone(&telemetry_store);
-
-        tokio::spawn(async move {
-            // ------------------------------------------------------------------
-            // Rate limiting — check before reading ANY request bytes
-            // ------------------------------------------------------------------
-            if rate_limiter.check_key(&addr.ip()).is_err() {
-                telemetry.lock().await.push("WARN", format!("Rate limit exceeded for IP {}", addr.ip()));
-                send_status_error(&mut socket, 429, "Rate limit exceeded").await;
-                return;
+        tokio::select! {
+            _ = shutdown_flag.notified() => {
+                eprintln!("[GATEWAY] Graceful restart requested via Management API...");
+                telemetry_store.lock().await.flush();
+                break;
             }
+            accept_result = listener.accept() => {
+                let (mut socket, addr) = match accept_result {
+                    Ok(res) => res,
+                    Err(e) => {
+                        eprintln!("[GATEWAY] Accept error: {}", e);
+                        continue;
+                    }
+                };
+                let nonce_store = Arc::clone(&nonce_store);
+                let private_key = Arc::clone(&private_key);
+                let rate_limiter = Arc::clone(&rate_limiter);
+                let shield_firewall = Arc::clone(&shield_firewall);
+                let telemetry = Arc::clone(&telemetry_store);
+                let mcp_client = mcp_client.clone();
+                let gateway_state = gateway_state.clone();
+                let trusted_proxies = Arc::clone(&trusted_proxies);
+
+                tokio::spawn(async move {
+            // (Rate limiting moved to after header parsing to properly identify X-Forwarded-For IPs)
 
             // ------------------------------------------------------------------
             // Read HTTP request headers — loop until \r\n\r\n or MAX_REQUEST_BYTES
@@ -572,7 +928,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })
                 .unwrap_or("");
 
-            let Some(Ok(_trusted_client)) = authorization.strip_prefix("Bearer ").map(authorize_client_key) else {
+            let Some(Ok(_trusted_client)) = authorization.strip_prefix("Bearer ").map(|k| {
+                let clients = gateway_state.trusted_clients.read().unwrap_or_else(|p| p.into_inner());
+                authorize_client_key(&clients, k)
+            }) else {
                 telemetry.lock().await.push("WARN", format!("Auth rejected from {}: Invalid/unknown token", addr.ip()));
                 send_status_error(&mut socket, 401, "Invalid authorization token").await;
                 return;
@@ -585,7 +944,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // Resolve real client IP behind proxy (e.g. NGINX)
-            let client_ip = ShieldFirewall::resolve_real_ip(addr.ip(), &header_str);
+            let client_ip = ShieldFirewall::resolve_real_ip(addr.ip(), &header_str, &trusted_proxies);
+
+            // ------------------------------------------------------------------
+            // Rate limiting — check the true client IP
+            // ------------------------------------------------------------------
+            if rate_limiter.check_key(&client_ip).is_err() {
+                telemetry.lock().await.push("WARN", format!("Rate limit exceeded for IP {}", client_ip));
+                // Add violation to Shield for repeated hammering
+                shield_firewall.record_violation(client_ip, "Rate limit exceeded (Brute-force protection)");
+                send_status_error(&mut socket, 429, "Rate limit exceeded").await;
+                return;
+            }
 
             // ------------------------------------------------------------------
             // BATON-Shield Header & Obfuscation Firewall Inspection
@@ -652,7 +1022,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // ------------------------------------------------------------------
             // Step 2 — Look up key in trusted_clients (revocation check)
             // ------------------------------------------------------------------
-            let trusted_client = match authorize_client_key(key_hex) {
+            let trusted_client_res = {
+                let clients = gateway_state.trusted_clients.read().unwrap_or_else(|p| p.into_inner());
+                authorize_client_key(&clients, key_hex)
+            };
+            let trusted_client = match trusted_client_res {
                 Ok(c) => c,
                 Err((status, msg)) => {
                     // Log auth failure without echoing back the client key or IP
@@ -750,7 +1124,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Enforce 5-minute timestamp skew window
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .expect("system clock is before epoch")
+                .unwrap_or_default()
                 .as_millis() as u64;
             let skew = if now > ts { now - ts } else { ts - now };
             if skew > 300_000 {
@@ -776,7 +1150,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             hk_hmac.expand(b"baton-hmac-signing", &mut signing_key)
                 .expect("HKDF expand is infallible for 32-byte output");
 
-            let signature_input = format!("ts={}:n_len={}:n={}:ct_len={}:ct={}", ts, n.len(), n, ciphertext_b64.len(), ciphertext_b64);
+            let signature_input = format!("ts={}:n_len={}:n={}:iv_len={}:iv={}:ct_len={}:ct={}", ts, n.len(), n, iv_b64.len(), iv_b64, ciphertext_b64.len(), ciphertext_b64);
             let mut mac_verify = <HmacSha256 as hmac::Mac>::new_from_slice(&signing_key)
                 .expect("HMAC key size is always valid");
             mac_verify.update(signature_input.as_bytes());
@@ -801,6 +1175,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // ------------------------------------------------------------------
             // Step 6 — Derive per-request AES-256-GCM key via HKDF and decrypt
+            // STUB: Here we will use `vodozemac::olm::Session` to decrypt the
+            // incoming message, replacing the AES-GCM logic. For example:
+            // let mut session = gateway_state.olm_account.lock().await.create_inbound_session(...);
+            // let decrypted_bytes = session.decrypt(...).unwrap();
             // ------------------------------------------------------------------
             let info = format!("{}:{}", ts, n);
             let hk_enc = Hkdf::<Sha256>::new(Some(HKDF_DOMAIN_SALT), &shared_secret);
@@ -857,24 +1235,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             telemetry.lock().await.push("INFO", format!("Payload received from user {} ({}B)", trusted_client.user_email, decrypted_bytes.len()));
 
             // ------------------------------------------------------------------
-            // Step 7 — Forward to real MCP agent (mock response for now)
+            // Step 7 — Forward to real MCP agent
             // ------------------------------------------------------------------
-            let mock_mcp_response = serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": "1",
-                "result": {
-                    "tools": [
-                        {
-                            "name": "read_file",
-                            "description": "Read file contents",
-                            "inputSchema": {}
-                        }
-                    ]
-                }
-            });
+            let mcp_url = std::env::var("MCP_AGENT_URL").unwrap_or_else(|_| "http://127.0.0.1:8000/mcp".to_string());
 
-            let response_plaintext = serde_json::to_string(&mock_mcp_response)
-                .expect("mock response serialization is infallible");
+            let response_plaintext = match mcp_client.post(&mcp_url)
+                .header("Content-Type", "application/json")
+                .body(decrypted_bytes)
+                .send()
+                .await
+            {
+                Ok(resp) => {
+                    resp.text().await.unwrap_or_else(|_| r#"{"jsonrpc": "2.0", "id": "1", "error": {"code": -32603, "message": "MCP agent unreachable"}}"#.to_string())
+                }
+                Err(_) => {
+                    r#"{"jsonrpc": "2.0", "id": "1", "error": {"code": -32603, "message": "MCP agent unreachable"}}"#.to_string()
+                }
+            };
 
             // Encrypt the response with a fresh IV
             let response_iv_bytes = rand::random::<[u8; 12]>();
@@ -882,7 +1259,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let hk_resp = Hkdf::<Sha256>::new(Some(HKDF_DOMAIN_SALT), &shared_secret);
             let mut derived_key_resp = [0u8; 32];
-            hk_resp.expand(info.as_bytes(), &mut derived_key_resp)
+            let resp_info = format!("resp:{}:{}", ts, n);
+            hk_resp.expand(resp_info.as_bytes(), &mut derived_key_resp)
                 .expect("HKDF expand is infallible for 32-byte output");
             shared_secret.zeroize();
 
@@ -915,7 +1293,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             telemetry.lock().await.push("INFO", format!("Request for '{}' handled successfully", trusted_client.user_email));
         });
+            }
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("[GATEWAY] Received ctrl-c, initiating graceful shutdown...");
+                telemetry_store.lock().await.flush();
+                eprintln!("[GATEWAY] Shutdown complete.");
+                break;
+            }
+        }
     }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1028,7 +1416,7 @@ mod tests {
 
     #[test]
     fn test_authorize_client_key_unknown() {
-        let result = authorize_client_key("0000000000000000000000000000000000000000000000000000000000000000");
+        let result = authorize_client_key(&vec![], "0000000000000000000000000000000000000000000000000000000000000000");
         assert!(result.is_err());
     }
 

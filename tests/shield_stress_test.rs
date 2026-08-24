@@ -52,7 +52,7 @@ fn test_proxy_real_ip_resolution() {
     let socket_ip: IpAddr = "127.0.0.1".parse().unwrap();
     let headers = "GET / HTTP/1.1\r\nX-Forwarded-For: 203.0.113.195, 127.0.0.1\r\n\r\n";
 
-    let real_ip = ShieldFirewall::resolve_real_ip(socket_ip, headers);
+    let real_ip = ShieldFirewall::resolve_real_ip(socket_ip, headers, &[]);
     assert_eq!(real_ip, "203.0.113.195".parse::<IpAddr>().unwrap(), "Should extract true client IP from X-Forwarded-For");
 }
 
