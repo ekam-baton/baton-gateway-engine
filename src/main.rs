@@ -200,12 +200,14 @@ impl NonceStore {
             return false;
         }
 
-        if self.nonces.contains_key(nonce) {
-            false
-        } else {
-            self.nonces.insert(nonce.to_string(), now_ms);
-            true
+        if let Some(&inserted_at) = self.nonces.get(nonce) {
+            if now_ms.saturating_sub(inserted_at) < NONCE_TTL_MS {
+                return false;
+            }
         }
+
+        self.nonces.insert(nonce.to_string(), now_ms);
+        true
     }
 }
 
@@ -287,7 +289,9 @@ impl TelemetryStore {
                     let signature = hex::encode(mac.finalize().into_bytes());
 
                     let client = reqwest::Client::new();
-                    if let Err(e) = client.post("http://127.0.0.1:8000/webhook/alert")
+                    let webhook_url = std::env::var("WEBHOOK_ALERT_URL")
+                        .unwrap_or_else(|_| "http://127.0.0.1:8000/webhook/alert".to_string());
+                    if let Err(e) = client.post(&webhook_url)
                         .header("X-Baton-Signature", signature)
                         .header("Content-Type", "application/json")
                         .body(payload_str)
@@ -325,8 +329,9 @@ impl TelemetryStore {
 }
 
 async fn run_tool_server(telemetry: Arc<Mutex<TelemetryStore>>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let listener = TcpListener::bind("127.0.0.1:8081").await?;
-    eprintln!("[TOOL SERVER] Internal management API listening on 127.0.0.1:8081");
+    let tool_bind = std::env::var("TOOL_SERVER_BIND").unwrap_or_else(|_| "127.0.0.1:8081".to_string());
+    let listener = TcpListener::bind(&tool_bind).await?;
+    eprintln!("[TOOL SERVER] Internal management API listening on {}", tool_bind);
     let client = reqwest::Client::new();
 
     loop {
@@ -629,6 +634,17 @@ async fn run_mgmt_api(telemetry: Arc<Mutex<TelemetryStore>>, shutdown_flag: Arc<
                 }
             }
 
+            if path == "/health" {
+                let response_body = r#"{"status":"ok","service":"gateway-engine"}"#;
+                let http_response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, http_response.as_bytes()).await;
+                return;
+            }
+
             if !auth_ok {
                 let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, b"HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n").await;
                 return;
@@ -675,7 +691,7 @@ async fn run_login() -> Result<(), Box<dyn std::error::Error>> {
 
     let email = std::env::var("BATON_EMAIL").unwrap_or_else(|_| {
         print!("Enter Email: ");
-        std::io::stdout().flush().unwrap();
+        let _ = std::io::stdout().flush();
         let mut email = String::new();
         std::io::stdin().read_line(&mut email).unwrap_or_default();
         email.trim().to_string()
@@ -683,7 +699,7 @@ async fn run_login() -> Result<(), Box<dyn std::error::Error>> {
     
     let password = std::env::var("BATON_PASSWORD").unwrap_or_else(|_| {
         print!("Enter Password: ");
-        std::io::stdout().flush().unwrap();
+        let _ = std::io::stdout().flush();
         let mut password = String::new();
         // rpassword should be used in production
         std::io::stdin().read_line(&mut password).unwrap_or_default();
@@ -696,7 +712,10 @@ async fn run_login() -> Result<(), Box<dyn std::error::Error>> {
         "password": password,
     });
     
-    let res = client.post("http://127.0.0.1:3001/auth/login")
+    let auth_url = std::env::var("BATON_AUTH_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:3001/auth/login".to_string());
+    
+    let res = client.post(&auth_url)
         .json(&payload)
         .send()
         .await?;
@@ -822,16 +841,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         sbom::scan_dependencies(telemetry_for_sbom).await;
     });
 
-    // Per-IP rate limiter: 30 requests per minute per IP
-    // This stops brute-force, replay flood, and DoS in one shot.
+    let rl_limit: u32 = std::env::var("RATE_LIMIT_PER_MIN")
+        .unwrap_or_else(|_| "30".to_string())
+        .parse()
+        .unwrap_or(30);
     let rate_limiter: Arc<DefaultKeyedRateLimiter<IpAddr>> = Arc::new(
-        RateLimiter::keyed(Quota::per_minute(nonzero!(30u32)))
+        RateLimiter::keyed(Quota::per_minute(std::num::NonZeroU32::new(rl_limit).unwrap_or(nonzero!(30u32))))
     );
 
     let mcp_client = reqwest::Client::new();
 
+    let shield_max_violations: usize = std::env::var("SHIELD_MAX_VIOLATIONS")
+        .unwrap_or_else(|_| "3".to_string())
+        .parse()
+        .unwrap_or(3);
+    let shield_blacklist_secs: u64 = std::env::var("SHIELD_BLACKLIST_SECS")
+        .unwrap_or_else(|_| "3600".to_string())
+        .parse()
+        .unwrap_or(3600);
     // BATON-Shield Custom AI-Aware Firewall Engine
-    let shield_firewall = Arc::new(ShieldFirewall::new(3, 3600));
+    let shield_firewall = Arc::new(ShieldFirewall::new(shield_max_violations, shield_blacklist_secs));
 
     // 2. Bind on all interfaces (0.0.0.0) so VPS clients can connect.
     //    In production, put a TLS-terminating reverse-proxy (nginx/caddy) in front.
@@ -1093,14 +1122,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
-            if timestamp.is_none() || nonce.is_none() {
-                send_status_error(&mut socket, 400, "Missing timestamp or nonce headers").await;
-                shared_secret.zeroize();
-                return;
-            }
-
-            let ts = timestamp.unwrap();
-            let n = nonce.unwrap();
+            let (ts, n) = match (timestamp, nonce) {
+                (Some(t), Some(no)) => (t, no),
+                _ => {
+                    send_status_error(&mut socket, 400, "Missing timestamp or nonce headers").await;
+                    shared_secret.zeroize();
+                    return;
+                }
+            };
 
             // Nonce must be a reasonable length to prevent hash-flooding
             if n.len() > 128 {
@@ -1147,12 +1176,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Derive HMAC signing key from the shared secret
             let hk_hmac = Hkdf::<Sha256>::new(Some(HKDF_DOMAIN_SALT), &shared_secret);
             let mut signing_key = [0u8; 32];
-            hk_hmac.expand(b"baton-hmac-signing", &mut signing_key)
-                .expect("HKDF expand is infallible for 32-byte output");
+            if hk_hmac.expand(b"baton-hmac-signing", &mut signing_key).is_err() {
+                send_status_error(&mut socket, 500, "Internal Server Error during key derivation").await;
+                shared_secret.zeroize();
+                return;
+            }
 
             let signature_input = format!("ts={}:n_len={}:n={}:iv_len={}:iv={}:ct_len={}:ct={}", ts, n.len(), n, iv_b64.len(), iv_b64, ciphertext_b64.len(), ciphertext_b64);
-            let mut mac_verify = <HmacSha256 as hmac::Mac>::new_from_slice(&signing_key)
-                .expect("HMAC key size is always valid");
+            let mut mac_verify = match <HmacSha256 as hmac::Mac>::new_from_slice(&signing_key) {
+                Ok(m) => m,
+                Err(_) => {
+                    send_status_error(&mut socket, 500, "Internal Server Error during HMAC init").await;
+                    signing_key.zeroize();
+                    shared_secret.zeroize();
+                    return;
+                }
+            };
             mac_verify.update(signature_input.as_bytes());
             signing_key.zeroize();
 
@@ -1183,8 +1222,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let info = format!("{}:{}", ts, n);
             let hk_enc = Hkdf::<Sha256>::new(Some(HKDF_DOMAIN_SALT), &shared_secret);
             let mut derived_key = [0u8; 32];
-            hk_enc.expand(info.as_bytes(), &mut derived_key)
-                .expect("HKDF expand is infallible for 32-byte output");
+            if hk_enc.expand(info.as_bytes(), &mut derived_key).is_err() {
+                send_status_error(&mut socket, 500, "Internal Server Error during key derivation").await;
+                shared_secret.zeroize();
+                return;
+            }
 
             let key = aes_gcm::Key::<Aes256Gcm>::from_slice(&derived_key);
             let cipher = Aes256Gcm::new(key);
@@ -1260,16 +1302,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let hk_resp = Hkdf::<Sha256>::new(Some(HKDF_DOMAIN_SALT), &shared_secret);
             let mut derived_key_resp = [0u8; 32];
             let resp_info = format!("resp:{}:{}", ts, n);
-            hk_resp.expand(resp_info.as_bytes(), &mut derived_key_resp)
-                .expect("HKDF expand is infallible for 32-byte output");
+            if hk_resp.expand(resp_info.as_bytes(), &mut derived_key_resp).is_err() {
+                send_status_error(&mut socket, 500, "Internal Server Error during response key derivation").await;
+                shared_secret.zeroize();
+                return;
+            }
             shared_secret.zeroize();
 
             let key_resp = aes_gcm::Key::<Aes256Gcm>::from_slice(&derived_key_resp);
             let cipher_resp = Aes256Gcm::new(key_resp);
 
-            let encrypted_response = cipher_resp
-                .encrypt(response_nonce, response_plaintext.as_bytes())
-                .expect("response encryption is infallible");
+            let encrypted_response = match cipher_resp.encrypt(response_nonce, response_plaintext.as_bytes()) {
+                Ok(enc) => enc,
+                Err(_) => {
+                    send_status_error(&mut socket, 500, "Internal Server Error during response encryption").await;
+                    derived_key_resp.zeroize();
+                    return;
+                }
+            };
             derived_key_resp.zeroize();
 
             let enc_resp_b64 = base64::engine::general_purpose::STANDARD.encode(encrypted_response);
@@ -1280,8 +1330,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "iv": iv_resp_b64
             });
 
-            let http_body = serde_json::to_string(&json_response)
-                .expect("response JSON serialization is infallible");
+            let http_body = match serde_json::to_string(&json_response) {
+                Ok(b) => b,
+                Err(_) => {
+                    send_status_error(&mut socket, 500, "Internal Server Error during response serialization").await;
+                    return;
+                }
+            };
             let http_response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 http_body.len(),

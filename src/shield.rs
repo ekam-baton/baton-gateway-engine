@@ -61,7 +61,7 @@ impl ShieldFirewall {
     }
 
     pub fn resolve_real_ip(socket_ip: IpAddr, header_str: &str, trusted_proxies: &[IpAddr]) -> IpAddr {
-        if !trusted_proxies.contains(&socket_ip) {
+        if !trusted_proxies.contains(&socket_ip) && !socket_ip.is_loopback() {
             return socket_ip; // Don't trust forwarded headers from untrusted sources
         }
         for line in header_str.lines() {
@@ -110,9 +110,9 @@ impl ShieldFirewall {
             return;
         }
 
-        // Memory Guard: Prune map if flooded with unique botnet IPs
-        if self.reputation_matrix.len() >= MAX_IP_TRACK_CAPACITY {
-            self.reputation_matrix.retain(|_, v| v.is_blacklisted || v.last_violation.elapsed() < Duration::from_secs(300));
+        if !self.reputation_matrix.contains_key(&ip) && self.reputation_matrix.len() >= MAX_IP_TRACK_CAPACITY {
+            eprintln!("[BATON-SHIELD] Warning: Reputation matrix full. Dropping violation for new IP {}", ip);
+            return;
         }
 
         let mut entry = self.reputation_matrix.entry(ip).or_insert(IpReputation {
