@@ -1,7 +1,7 @@
 #[path = "../src/shield.rs"]
 mod shield;
 
-use shield::{calculate_shannon_entropy, check_chunked_entropy, ShieldFirewall};
+use shield::{calculate_shannon_entropy, ShieldFirewall};
 use std::net::IpAddr;
 use std::thread;
 
@@ -79,4 +79,26 @@ fn test_multithreaded_concurrent_stress() {
     // Verify system remains fully responsive and stable under concurrent load
     let test_ip: IpAddr = "10.0.0.1".parse().unwrap();
     assert!(shield.is_blacklisted(&test_ip));
+}
+
+#[test]
+fn test_manual_blacklist_whitelist_and_lockdown() {
+    let shield = ShieldFirewall::new(3, 3600);
+    let ip: IpAddr = "198.51.100.5".parse().unwrap();
+
+    assert!(!shield.is_blacklisted(&ip));
+    shield.blacklist_ip(ip);
+    assert!(shield.is_blacklisted(&ip));
+
+    shield.whitelist_ip(ip);
+    assert!(!shield.is_blacklisted(&ip));
+
+    assert!(!shield.is_emergency_lockdown());
+    shield.set_emergency_lockdown(true);
+    assert!(shield.is_emergency_lockdown());
+    assert!(shield.inspect_headers_and_uri(ip, "GET / HTTP/1.1\r\n\r\n").is_err());
+
+    shield.set_emergency_lockdown(false);
+    assert!(!shield.is_emergency_lockdown());
+    assert!(shield.inspect_headers_and_uri(ip, "GET / HTTP/1.1\r\n\r\n").is_ok());
 }

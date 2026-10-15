@@ -44,11 +44,14 @@ pub struct IpReputation {
     pub is_blacklisted: bool,
 }
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 pub struct ShieldFirewall {
     // Lock-free concurrent hashmap for multi-gigabit throughput
     reputation_matrix: DashMap<IpAddr, IpReputation>,
     max_violations: usize,
     blacklist_duration: Duration,
+    emergency_lockdown: AtomicBool,
 }
 
 impl ShieldFirewall {
@@ -57,6 +60,7 @@ impl ShieldFirewall {
             reputation_matrix: DashMap::new(),
             max_violations,
             blacklist_duration: Duration::from_secs(blacklist_secs),
+            emergency_lockdown: AtomicBool::new(false),
         }
     }
 
@@ -67,7 +71,7 @@ impl ShieldFirewall {
         for line in header_str.lines() {
             let lower = line.to_lowercase();
             if lower.starts_with("x-real-ip:") || lower.starts_with("x-forwarded-for:") {
-                if let Some(val) = line.splitn(2, ':').nth(1) {
+                if let Some(val) = line.split_once(':').map(|x| x.1) {
                     let ips: Vec<&str> = val.split(',').collect();
                     // Iterate from right (most trusted) to left to find the first untrusted IP
                     for ip_str in ips.iter().rev() {
@@ -132,8 +136,48 @@ impl ShieldFirewall {
         }
     }
 
+    /// Manually blacklists an IP address immediately.
+    pub fn blacklist_ip(&self, ip: IpAddr) {
+        if ip.is_loopback() {
+            return;
+        }
+        let mut entry = self.reputation_matrix.entry(ip).or_insert(IpReputation {
+            violations: self.max_violations,
+            last_violation: Instant::now(),
+            is_blacklisted: true,
+        });
+        entry.violations = self.max_violations;
+        entry.last_violation = Instant::now();
+        entry.is_blacklisted = true;
+        eprintln!("[BATON-SHIELD] 🚨 IP {} manually BLACKLISTED", ip);
+    }
+
+    /// Manually whitelists / rehabilitates an IP address.
+    pub fn whitelist_ip(&self, ip: IpAddr) {
+        if let Some(mut ref_mut) = self.reputation_matrix.get_mut(&ip) {
+            let rep = ref_mut.value_mut();
+            rep.is_blacklisted = false;
+            rep.violations = 0;
+            eprintln!("[BATON-SHIELD] IP {} manually WHITELISTED / rehabilitated", ip);
+        }
+    }
+
+    /// Toggles the emergency lockdown state.
+    pub fn set_emergency_lockdown(&self, enabled: bool) {
+        self.emergency_lockdown.store(enabled, Ordering::SeqCst);
+        eprintln!("[BATON-SHIELD] Emergency lockdown state set to: {}", enabled);
+    }
+
+    /// Returns whether emergency lockdown is currently active.
+    pub fn is_emergency_lockdown(&self) -> bool {
+        self.emergency_lockdown.load(Ordering::SeqCst)
+    }
+
     /// Inspects HTTP Header strings and URI paths for high entropy obfuscation / shellcode / SQLi
     pub fn inspect_headers_and_uri(&self, ip: IpAddr, header_str: &str) -> Result<(), String> {
+        if self.is_emergency_lockdown() && !ip.is_loopback() {
+            return Err("BATON-Shield: EMERGENCY LOCKDOWN ACTIVE. All external traffic dropped.".to_string());
+        }
         if self.is_blacklisted(&ip) {
             return Err(format!("IP {} is blacklisted by BATON-Shield Firewall", ip));
         }

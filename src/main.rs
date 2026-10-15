@@ -156,6 +156,7 @@ fn load_trusted_clients() -> Result<Vec<TrustedClient>, String> {
 #[derive(Clone)]
 struct GatewayState {
     trusted_clients: Arc<std::sync::RwLock<Vec<TrustedClient>>>,
+    #[allow(dead_code)]
     olm_account: Arc<tokio::sync::Mutex<vodozemac::olm::Account>>,
 }
 
@@ -328,7 +329,7 @@ impl TelemetryStore {
     }
 }
 
-async fn run_tool_server(telemetry: Arc<Mutex<TelemetryStore>>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn run_tool_server(telemetry: Arc<Mutex<TelemetryStore>>, shield: Arc<ShieldFirewall>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let tool_bind = std::env::var("TOOL_SERVER_BIND").unwrap_or_else(|_| "127.0.0.1:8081".to_string());
     let listener = TcpListener::bind(&tool_bind).await?;
     eprintln!("[TOOL SERVER] Internal management API listening on {}", tool_bind);
@@ -337,6 +338,7 @@ async fn run_tool_server(telemetry: Arc<Mutex<TelemetryStore>>) -> Result<(), Bo
     loop {
         let (mut socket, _) = listener.accept().await?;
         let telemetry = Arc::clone(&telemetry);
+        let shield = Arc::clone(&shield);
         let client = client.clone();
 
         tokio::spawn(async move {
@@ -364,7 +366,7 @@ async fn run_tool_server(telemetry: Arc<Mutex<TelemetryStore>>) -> Result<(), Bo
             for line in header_str.lines().skip(1) {
                 let lower = line.to_lowercase();
                 if lower.starts_with("mgmt-api-key:") {
-                    if let Some(val) = line.splitn(2, ':').nth(1) {
+                    if let Some(val) = line.split_once(':').map(|x| x.1) {
                         use sha2::{Sha256, Digest};
                         let expected_hash = Sha256::digest(expected_key.as_bytes());
                         let provided_hash = Sha256::digest(val.trim().as_bytes());
@@ -384,7 +386,7 @@ async fn run_tool_server(telemetry: Arc<Mutex<TelemetryStore>>) -> Result<(), Bo
                 .find_map(|line| {
                     let lower = line.to_lowercase();
                     if lower.starts_with("content-length:") {
-                        line.splitn(2, ':').nth(1)?.trim().parse().ok()
+                        line.split_once(':')?.1.trim().parse().ok()
                     } else {
                         None
                     }
@@ -420,6 +422,42 @@ async fn run_tool_server(telemetry: Arc<Mutex<TelemetryStore>>) -> Result<(), Bo
                 let limit = kwargs.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
                 let logs = telemetry.lock().await.get_logs(limit);
                 serde_json::json!({ "result": logs })
+            } else if tool_name == "blacklist_ip" {
+                if let Some(ip_str) = kwargs.get("ip").and_then(|v| v.as_str()) {
+                    if let Ok(ip) = ip_str.parse::<IpAddr>() {
+                        shield.blacklist_ip(ip);
+                        telemetry.lock().await.push("WARN", format!("Admin manually blacklisted IP {}", ip));
+                        serde_json::json!({ "status": "ok", "message": format!("IP {} blacklisted successfully", ip) })
+                    } else {
+                        serde_json::json!({ "status": "error", "message": "Invalid IP address format" })
+                    }
+                } else {
+                    serde_json::json!({ "status": "error", "message": "Missing 'ip' parameter" })
+                }
+            } else if tool_name == "whitelist_ip" {
+                if let Some(ip_str) = kwargs.get("ip").and_then(|v| v.as_str()) {
+                    if let Ok(ip) = ip_str.parse::<IpAddr>() {
+                        shield.whitelist_ip(ip);
+                        telemetry.lock().await.push("INFO", format!("Admin manually whitelisted IP {}", ip));
+                        serde_json::json!({ "status": "ok", "message": format!("IP {} whitelisted successfully", ip) })
+                    } else {
+                        serde_json::json!({ "status": "error", "message": "Invalid IP address format" })
+                    }
+                } else {
+                    serde_json::json!({ "status": "error", "message": "Missing 'ip' parameter" })
+                }
+            } else if tool_name == "emergency_lockdown" {
+                let enabled = kwargs.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+                shield.set_emergency_lockdown(enabled);
+                let level = if enabled { "CRITICAL" } else { "INFO" };
+                telemetry.lock().await.push(level, format!("Emergency lockdown toggled: enabled={}", enabled));
+                serde_json::json!({ "status": "ok", "emergency_lockdown": enabled })
+            } else if tool_name == "list_pending_patches" {
+                serde_json::json!({ "status": "ok", "patches": [] })
+            } else if tool_name == "approve_patch" || tool_name == "reject_patch" {
+                let action = if tool_name == "approve_patch" { "approved" } else { "rejected" };
+                telemetry.lock().await.push("INFO", format!("Maintainer swarm patch {} by admin", action));
+                serde_json::json!({ "status": "ok", "action": action })
             } else if tool_name == "lookup_cve" {
                 let pkg = kwargs.get("package_name").and_then(|v| v.as_str()).unwrap_or("");
                 let ver = kwargs.get("version").and_then(|v| v.as_str()).unwrap_or("");
@@ -622,7 +660,7 @@ async fn run_mgmt_api(telemetry: Arc<Mutex<TelemetryStore>>, shutdown_flag: Arc<
                 } else {
                     let lower = line.to_lowercase();
                     if lower.starts_with("mgmt-api-key:") {
-                        if let Some(val) = line.splitn(2, ':').nth(1) {
+                        if let Some(val) = line.split_once(':').map(|x| x.1) {
                             use sha2::{Sha256, Digest};
                             let expected_hash = Sha256::digest(expected_key.as_bytes());
                             let provided_hash = Sha256::digest(val.trim().as_bytes());
@@ -821,8 +859,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter_map(|s| s.trim().parse().ok())
         .collect());
 
+    let shield_max_violations: usize = std::env::var("SHIELD_MAX_VIOLATIONS")
+        .unwrap_or_else(|_| "3".to_string())
+        .parse()
+        .unwrap_or(3);
+    let shield_blacklist_secs: u64 = std::env::var("SHIELD_BLACKLIST_SECS")
+        .unwrap_or_else(|_| "3600".to_string())
+        .parse()
+        .unwrap_or(3600);
+    // BATON-Shield Custom AI-Aware Firewall Engine
+    let shield_firewall = Arc::new(ShieldFirewall::new(shield_max_violations, shield_blacklist_secs));
+
+    let shield_for_server = Arc::clone(&shield_firewall);
     tokio::spawn(async move {
-        if let Err(e) = run_tool_server(telemetry_for_server).await {
+        if let Err(e) = run_tool_server(telemetry_for_server, shield_for_server).await {
             eprintln!("[TOOL SERVER] Fatal error: {}", e);
         }
     });
@@ -855,17 +905,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let mcp_client = reqwest::Client::new();
-
-    let shield_max_violations: usize = std::env::var("SHIELD_MAX_VIOLATIONS")
-        .unwrap_or_else(|_| "3".to_string())
-        .parse()
-        .unwrap_or(3);
-    let shield_blacklist_secs: u64 = std::env::var("SHIELD_BLACKLIST_SECS")
-        .unwrap_or_else(|_| "3600".to_string())
-        .parse()
-        .unwrap_or(3600);
-    // BATON-Shield Custom AI-Aware Firewall Engine
-    let shield_firewall = Arc::new(ShieldFirewall::new(shield_max_violations, shield_blacklist_secs));
 
     // 2. Bind on all interfaces (0.0.0.0) so VPS clients can connect.
     //    In production, put a TLS-terminating reverse-proxy (nginx/caddy) in front.
@@ -943,7 +982,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .find_map(|line| {
                     let lower = line.to_lowercase();
                     if lower.starts_with("content-length:") {
-                        line.splitn(2, ':').nth(1)?.trim().parse().ok()
+                        line.split_once(':')?.1.trim().parse().ok()
                     } else {
                         None
                     }
@@ -955,7 +994,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .find_map(|line| {
                     let lower = line.to_lowercase();
                     if lower.starts_with("authorization:") {
-                        Some(line.splitn(2, ':').nth(1)?.trim())
+                        Some(line.split_once(':')?.1.trim())
                     } else {
                         None
                     }
@@ -1032,13 +1071,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             for line in header_part.lines() {
                 let lower = line.to_lowercase();
                 if lower.starts_with("x-baton-timestamp:") {
-                    timestamp = line.splitn(2, ':').nth(1).and_then(|s| s.trim().parse().ok());
+                    timestamp = line.split_once(':').map(|x| x.1).and_then(|s| s.trim().parse().ok());
                 } else if lower.starts_with("x-baton-nonce:") {
-                    nonce = line.splitn(2, ':').nth(1).map(str::trim);
+                    nonce = line.split_once(':').map(|x| x.1).map(str::trim);
                 } else if lower.starts_with("x-baton-signature:") {
-                    signature = line.splitn(2, ':').nth(1).map(str::trim);
+                    signature = line.split_once(':').map(|x| x.1).map(str::trim);
                 } else if lower.starts_with("x-baton-client-key:") {
-                    client_key_hex = line.splitn(2, ':').nth(1).map(str::trim);
+                    client_key_hex = line.split_once(':').map(|x| x.1).map(str::trim);
                 }
             }
 
@@ -1458,7 +1497,7 @@ mod tests {
     #[test]
     fn test_iv_length_validation() {
         // Simulate what happens with a bad IV — must NOT panic
-        let bad_iv = vec![0u8; 8]; // too short
+        let bad_iv = [0u8; 8]; // too short
         assert_ne!(bad_iv.len(), 12, "Bad IV must not be 12 bytes");
         // The gateway now guards this before calling Nonce::from_slice
     }
@@ -1476,7 +1515,7 @@ mod tests {
 
     #[test]
     fn test_authorize_client_key_unknown() {
-        let result = authorize_client_key(&vec![], "0000000000000000000000000000000000000000000000000000000000000000");
+        let result = authorize_client_key(&[], "0000000000000000000000000000000000000000000000000000000000000000");
         assert!(result.is_err());
     }
 
