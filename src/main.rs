@@ -650,14 +650,18 @@ async fn run_mgmt_api(telemetry: Arc<Mutex<TelemetryStore>>, shutdown_flag: Arc<
                 return;
             }
 
-            let mut response_body = String::new();
-            if path == "/mgmt/status" {
-                response_body = r#"{"status":"ok"}"#.to_string();
+            let response_body = if path == "/mgmt/status" {
+                r#"{"status":"ok"}"#.to_string()
             } else if path == "/mgmt/logs" {
                 let logs = telemetry.lock().await.get_logs(100);
-                response_body = serde_json::to_string(&logs).unwrap_or_else(|_| "[]".to_string());
+                serde_json::to_string(&logs).unwrap_or_else(|_| "[]".to_string())
             } else if path == "/mgmt/restart" {
-                response_body = r#"{"status":"restarting"}"#.to_string();
+                r#"{"status":"restarting"}"#.to_string()
+            } else {
+                r#"{"error":"not_found"}"#.to_string()
+            };
+
+            if path == "/mgmt/restart" {
                 let http_response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     response_body.len(),
@@ -666,7 +670,9 @@ async fn run_mgmt_api(telemetry: Arc<Mutex<TelemetryStore>>, shutdown_flag: Arc<
                 let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, http_response.as_bytes()).await;
                 shutdown_flag.notify_one();
                 return;
-            } else {
+            }
+
+            if path != "/mgmt/status" && path != "/mgmt/logs" {
                 let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, b"HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n").await;
                 return;
             }
@@ -676,7 +682,6 @@ async fn run_mgmt_api(telemetry: Arc<Mutex<TelemetryStore>>, shutdown_flag: Arc<
                 response_body.len(),
                 response_body
             );
-            
             let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, http_response.as_bytes()).await;
         });
     }
@@ -1155,7 +1160,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64;
-            let skew = if now > ts { now - ts } else { ts - now };
+            let skew = now.abs_diff(ts);
             if skew > 300_000 {
                 send_status_error(&mut socket, 401, "Signature expired").await;
                 shared_secret.zeroize();
